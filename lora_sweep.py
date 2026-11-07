@@ -8,7 +8,7 @@ Usage:
 
 Needs only Python 3.8+ (standard library). Start ComfyUI first.
 """
-import argparse, copy, json, mimetypes, os, re, sys, threading, time, uuid
+import argparse, base64, copy, json, mimetypes, os, re, sys, threading, time, uuid, subprocess, tempfile, shutil, math
 import urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -21,6 +21,15 @@ RUNS = {}
 WF = {"data": None}
 TEXT_KEYS = ("text", "prompt", "positive", "positive_prompt", "text_positive", "caption")
 VIDEO_EXT = (".mp4", ".webm", ".mov", ".mkv", ".gif", ".webp", ".avi")
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".webp")
+REF_NAMES = []
+FACE_LOCK = threading.Lock()
+FACE_APP = None
+SCORING_ACTIVE = set()
+VOICE_ACTIVE = set()
+VOICE_LOCK = threading.Lock()
+VOICE_ENCODER = None
+
 
 
 # ---------------------------------------------------------------- ComfyUI client
@@ -137,6 +146,306 @@ def load_workflow_file():
     except Exception:
         WF["data"] = None
 
+
+
+# ----------------------------------------------------- Optional face likeness engine
+# Optional packages: insightface, onnxruntime, numpy, opencv-python; ffmpeg for videos.
+# Similarity is a cosine similarity, NOT a calibrated percentage or proof of identity.
+def refs_dir():
+    return os.path.join(ROOT, "references")
+
+
+def list_references():
+    os.makedirs(refs_dir(), exist_ok=True)
+    return sorted((n for n in os.listdir(refs_dir()) if n.lower().endswith(IMAGE_EXT)), key=natural)
+
+
+def get_face_engine():
+    global FACE_APP
+    with FACE_LOCK:
+        if FACE_APP is None:
+            try:
+                from insightface.app import FaceAnalysis
+                app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+                app.prepare(ctx_id=-1, det_size=(640, 640))
+                FACE_APP = app
+            except Exception as e:
+                raise RuntimeError("Face scoring unavailable. Install optional packages: "
+                                   "python -m pip install insightface onnxruntime opencv-python numpy. "
+                                   "First use may download model weights. Details: " + str(e))
+        return FACE_APP
+
+
+def face_embedding(path, app):
+    import cv2
+    im = cv2.imread(path)
+    if im is None:
+        raise ValueError("Could not decode image")
+    faces = app.get(im)
+    if not faces:
+        raise ValueError("No face found")
+    # Pick largest detected face, useful for single-character reference shots.
+    f = max(faces, key=lambda x: (x.bbox[2]-x.bbox[0])*(x.bbox[3]-x.bbox[1]))
+    return f.normed_embedding
+
+
+def sample_frames(path, work):
+    if path.lower().endswith(IMAGE_EXT):
+        return [path]
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is required for scoring video clips; install ffmpeg and add it to PATH")
+    # Extract evenly spaced frames from the first several seconds; cap at five.
+    samples = []
+    for index, second in enumerate((0.35, 0.85, 1.35, 1.85, 2.35)):
+        out = os.path.join(work, "frame_%s.jpg" % index)
+        cp = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", str(second),
+                             "-i", path, "-frames:v", "1", "-q:v", "3", out],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=35)
+        if cp.returncode == 0 and os.path.isfile(out):
+            samples.append(out)
+    if not samples:
+        raise ValueError("No frames could be extracted from this video")
+    return samples
+
+
+def score_job(job, reference_embeddings, app, rid):
+    import numpy as np
+    url = job.get("file", "")
+    if not url.startswith("/files/%s/" % rid):
+        raise ValueError("Saved video is missing")
+    path = os.path.join(run_dir(rid), os.path.basename(urllib.parse.unquote(url)))
+    if not os.path.isfile(path):
+        raise ValueError("Saved video file is not present")
+    with tempfile.TemporaryDirectory() as td:
+        frames = sample_frames(path, td)
+        similarities = []
+        for f in frames:
+            try:
+                emb = face_embedding(f, app)
+                similarities.append(max(float(np.dot(emb, ref)) for ref in reference_embeddings))
+            except ValueError:
+                continue
+    if not similarities:
+        raise ValueError("No detectable face in sampled frames")
+    return {"cosine_similarity": round(float(sum(similarities)/len(similarities)), 4),
+            "minimum_similarity": round(float(min(similarities)), 4),
+            "frames_scored": len(similarities)}
+
+
+def score_worker(run):
+    rid = run["id"]
+    try:
+        names = run.get("reference_names") or []
+        if not names:
+            run["analysis_error"] = "Upload a reference photo first, then click Score this run"
+            return
+        app = get_face_engine()
+        import numpy as np
+        refs = []
+        for n in names:
+            try:
+                emb = face_embedding(os.path.join(refs_dir(), n), app)
+                refs.append(np.asarray(emb, dtype=np.float32))
+            except Exception as e:
+                run.setdefault("reference_warnings", []).append(n + ": " + str(e))
+        if not refs:
+            raise ValueError("No faces found in selected reference images")
+        for job in run["jobs"]:
+            if job.get("status") != "done" or not job.get("file"):
+                continue
+            try:
+                job["likeness"] = score_job(job, refs, app, rid)
+                job.pop("likeness_error", None)
+            except Exception as e:
+                job["likeness_error"] = str(e)[:240]
+            save_run(run)
+        run["analysis_error"] = None
+    except Exception as e:
+        run["analysis_error"] = str(e)[:600]
+    finally:
+        run["analyzing"] = False
+        save_run(run)
+        SCORING_ACTIVE.discard(rid)
+
+
+def start_scoring(run, reference_names=None):
+    rid = run["id"]
+    if rid in SCORING_ACTIVE:
+        return
+    if reference_names is not None:
+        available = set(list_references())
+        selected = list(dict.fromkeys(reference_names))
+        if any(n not in available for n in selected):
+            raise ValueError("One or more reference images are missing")
+        run["reference_names"] = selected
+    if not run.get("reference_names"):
+        raise ValueError("Select one or more reference images before scoring")
+    SCORING_ACTIVE.add(rid)
+    run["analyzing"] = True
+    run["analysis_error"] = None
+    save_run(run)
+    threading.Thread(target=score_worker, args=(run,), daemon=True).start()
+
+
+def add_reference(body):
+    name = os.path.basename(str(body.get("name", "reference.jpg")))
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in (".jpg", ".jpeg", ".png", ".webp"):
+        raise ValueError("Please upload a JPG, PNG or WebP image")
+    encoded = body.get("base64") or ""
+    if len(encoded) > 12_000_000:
+        raise ValueError("Reference image must be smaller than 8 MB")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except Exception:
+        raise ValueError("Invalid image upload")
+    if len(raw) > 8_000_000 or len(raw) < 100:
+        raise ValueError("Reference image must be between 100 bytes and 8 MB")
+    if not (raw.startswith(b"\xff\xd8\xff") or raw.startswith(b"\x89PNG\r\n\x1a\n") or raw.startswith(b"RIFF") and raw[8:12] == b"WEBP"):
+        raise ValueError("File does not appear to be a supported image")
+    os.makedirs(refs_dir(), exist_ok=True)
+    safe = re.sub(r"[^a-zA-Z0-9_.-]", "_", os.path.splitext(name)[0])[:65] or "reference"
+    outname = safe + "_" + uuid.uuid4().hex[:8] + ext
+    with open(os.path.join(refs_dir(), outname), "wb") as fh:
+        fh.write(raw)
+    return outname
+
+
+# -------------------------------------------------- Optional voice similarity engine
+# Uses resemblyzer speaker embeddings; embeddings measure vocal similarity, not
+# transcript correctness or a scientifically calibrated percent identity.
+VOICE_EXT = (".wav", ".mp3", ".flac", ".m4a", ".ogg")
+
+def voice_refs_dir():
+    return os.path.join(ROOT, "voice_references")
+
+def list_voice_references():
+    os.makedirs(voice_refs_dir(), exist_ok=True)
+    return sorted((n for n in os.listdir(voice_refs_dir()) if n.lower().endswith(VOICE_EXT)), key=natural)
+
+def add_voice_reference(body):
+    original = os.path.basename(str(body.get("name", "voice.wav")))
+    ext = os.path.splitext(original)[1].lower()
+    if ext not in VOICE_EXT:
+        raise ValueError("Voice reference must be WAV, MP3, FLAC, M4A, or OGG")
+    encoded = body.get("base64") or ""
+    if len(encoded) > 30_000_000:
+        raise ValueError("Voice reference exceeds the 20 MB upload limit")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except Exception:
+        raise ValueError("Invalid audio upload")
+    if not 100 < len(raw) <= 20_000_000:
+        raise ValueError("Voice reference must be smaller than 20 MB")
+    os.makedirs(voice_refs_dir(), exist_ok=True)
+    safe = re.sub(r"[^a-zA-Z0-9_.-]", "_", os.path.splitext(original)[0])[:65] or "voice"
+    name = safe + "_" + uuid.uuid4().hex[:8] + ext
+    with open(os.path.join(voice_refs_dir(), name), "wb") as f:
+        f.write(raw)
+    return name
+
+def voice_engine():
+    global VOICE_ENCODER
+    with VOICE_LOCK:
+        if VOICE_ENCODER is None:
+            try:
+                from resemblyzer import VoiceEncoder
+                VOICE_ENCODER = VoiceEncoder(device="cpu")
+            except Exception as e:
+                raise RuntimeError("Voice model unavailable. Install with: python -m pip install resemblyzer. "
+                                   "The first run may download model weights. Details: " + str(e))
+        return VOICE_ENCODER
+
+def audio_embedding(source, encoder, work, name):
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is required for voice scoring; add ffmpeg to Windows PATH")
+    out = os.path.join(work, name + ".wav")
+    # One minute max per sample, remove video and convert to mono 16kHz PCM.
+    cp = subprocess.run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                         "-i", source, "-vn", "-t", "60", "-ac", "1", "-ar", "16000",
+                         "-c:a", "pcm_s16le", out], capture_output=True, timeout=120)
+    if cp.returncode != 0 or not os.path.isfile(out):
+        raise ValueError("Could not extract audio: " + cp.stderr.decode("utf-8", "replace")[-180:])
+    from resemblyzer import preprocess_wav
+    import numpy as np
+    wav = preprocess_wav(out)
+    # preprocess_wav attempts to trim silence; a short or quiet clip cannot be compared reliably.
+    if wav.size < 16000 * 1.3:
+        raise ValueError("Not enough usable speech (need at least ~1.3 seconds)")
+    if float(np.sqrt(np.mean(np.square(wav.astype(np.float32))))) < 0.002:
+        raise ValueError("Audio appears silent or too quiet for voice scoring")
+    emb = encoder.embed_utterance(wav)
+    norm = float(np.linalg.norm(emb))
+    if not np.isfinite(norm) or norm == 0:
+        raise ValueError("Voice embedding could not be computed")
+    return np.asarray(emb, dtype=np.float32) / norm
+
+def voice_score_worker(run):
+    rid = run["id"]
+    try:
+        names = run.get("voice_reference_names") or []
+        if not names:
+            raise ValueError("Upload and select at least one original voice sample")
+        encoder = voice_engine()
+        import numpy as np
+        with tempfile.TemporaryDirectory() as td:
+            refs = []
+            for idx, name in enumerate(names):
+                if name not in list_voice_references():
+                    continue
+                try:
+                    refs.append(audio_embedding(os.path.join(voice_refs_dir(), name), encoder, td, "ref_%s" % idx))
+                except Exception as e:
+                    run.setdefault("voice_reference_warnings", []).append(name + ": " + str(e)[:200])
+            if not refs:
+                raise ValueError("No usable voice reference audio. Use clear speech without music, ideally 5–30 seconds")
+            for i, job in enumerate(run["jobs"]):
+                if job.get("status") != "done" or not job.get("file"):
+                    continue
+                try:
+                    url = job["file"]
+                    if not url.startswith("/files/%s/" % rid):
+                        raise ValueError("Saved video is missing")
+                    path = os.path.join(run_dir(rid), os.path.basename(urllib.parse.unquote(url)))
+                    if not os.path.isfile(path) or not path.lower().endswith(VIDEO_EXT):
+                        raise ValueError("No saved video with an audio track")
+                    emb = audio_embedding(path, encoder, td, "generated_%s" % i)
+                    scores = [float(np.dot(emb, ref)) for ref in refs]
+                    job["voice_similarity"] = {"cosine_similarity": round(max(scores), 4),
+                                               "reference_count": len(refs)}
+                    job.pop("voice_error", None)
+                except Exception as e:
+                    job.pop("voice_similarity", None)
+                    job["voice_error"] = str(e)[:220]
+                save_run(run)
+        run["voice_analysis_error"] = None
+    except Exception as e:
+        run["voice_analysis_error"] = str(e)[:450]
+    finally:
+        run["voice_analyzing"] = False
+        save_run(run)
+        VOICE_ACTIVE.discard(rid)
+
+def start_voice_scoring(run, names=None):
+    rid = run["id"]
+    if rid in VOICE_ACTIVE:
+        return
+    if names is not None:
+        available = set(list_voice_references())
+        selected = list(dict.fromkeys(names))
+        if any(n not in available for n in selected):
+            raise ValueError("One or more selected voice references are missing")
+        run["voice_reference_names"] = selected
+    if not run.get("voice_reference_names"):
+        raise ValueError("Select voice reference audio before scoring")
+    VOICE_ACTIVE.add(rid)
+    run["voice_analyzing"] = True
+    run["voice_analysis_error"] = None
+    run["voice_reference_warnings"] = []
+    save_run(run)
+    threading.Thread(target=voice_score_worker, args=(run,), daemon=True).start()
 
 # ---------------------------------------------------------------- runs
 def run_dir(rid):
@@ -266,6 +575,16 @@ def run_worker(run):
         time.sleep(2)
     run["finished"] = True
     save_run(run)
+    if run.get("reference_names"):
+        try:
+            start_scoring(run)
+        except ValueError:
+            pass
+    if run.get("voice_reference_names"):
+        try:
+            start_voice_scoring(run)
+        except ValueError:
+            pass
 
 
 def start_run(body):
@@ -290,7 +609,9 @@ def start_run(body):
     run = {"id": rid, "created": time.time(), "prompt": body.get("prompt", ""), "lora_node": ln, "prompt_node": pn,
            "seed": int(seed) if seed not in (None, "") else None,
            "strength": float(strength) if strength not in (None, "") else None,
-           "jobs": jobs, "cancel": False, "finished": False}
+           "jobs": jobs, "cancel": False, "finished": False,
+           "reference_names": body.get("reference_names") or [],
+           "voice_reference_names": body.get("voice_reference_names") or []}
     RUNS[rid] = run
     save_run(run)
     threading.Thread(target=run_worker, args=(run,), daemon=True).start()
@@ -392,6 +713,10 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(analyze(WF["data"]))
             elif path == "/api/loras":
                 self.send_json({"loras": list_loras()})
+            elif path == "/api/references":
+                self.send_json({"references": list_references()})
+            elif path == "/api/voice_references":
+                self.send_json({"references": list_voice_references()})
             elif path == "/api/runs":
                 runs = sorted(RUNS.values(), key=lambda r: r["created"], reverse=True)
                 self.send_json([{"id": r["id"], "prompt": r["prompt"][:80], "count": len(r["jobs"])} for r in runs])
@@ -424,6 +749,26 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(analyze(wf))
             elif path == "/api/run":
                 self.send_json(start_run(self.body()))
+            elif path == "/api/reference":
+                self.send_json({"name": add_reference(self.body())})
+            elif path == "/api/voice_reference":
+                self.send_json({"name": add_voice_reference(self.body())})
+            elif path.startswith("/api/run/") and path.endswith("/voice_score"):
+                rid = path.split("/")[3]
+                run = RUNS.get(rid)
+                if not run:
+                    self.send_json({"error": "No such run"}, 404)
+                else:
+                    start_voice_scoring(run, (self.body()).get("voice_reference_names"))
+                    self.send_json({"ok": True})
+            elif path.startswith("/api/run/") and path.endswith("/score"):
+                rid = path.split("/")[3]
+                run = RUNS.get(rid)
+                if not run:
+                    self.send_json({"error": "No such run"}, 404)
+                else:
+                    start_scoring(run, (self.body()).get("reference_names"))
+                    self.send_json({"ok": True})
             elif path.startswith("/api/run/") and path.endswith("/cancel"):
                 run = RUNS.get(path.split("/")[3])
                 if run:
@@ -474,6 +819,17 @@ button:disabled{opacity:.5;cursor:not-allowed}
 .rank{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .chip{border:1px solid var(--line);border-radius:999px;padding:3px 12px;font-size:12px;background:var(--panel)}
 .hint{color:var(--muted);font-size:13px}
+.scoreboard{border:1px solid var(--line);border-radius:8px;padding:12px;background:var(--panel2)}
+.scoreboard:empty{display:none}
+.scoreboard h3{margin:0 0 6px;font-size:17px}
+.scoreboard p{margin:5px 0 12px;color:var(--muted);font-size:13px}
+.score-row{display:grid;grid-template-columns:minmax(105px,1fr) 92px 55px;gap:10px;align-items:center;padding:8px 0;border-top:1px solid var(--line)}
+.score-row .val{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
+.score-row .place{text-align:right;color:var(--muted)}
+.scorebar{height:7px;border-radius:20px;background:var(--line);overflow:hidden;margin-top:4px}
+.scorefill{height:100%;background:var(--accent);border-radius:20px}
+.score-note{font-size:13px;color:var(--fg);padding:8px 10px;border-left:3px solid var(--accent);background:var(--panel);margin:8px 0}
+.likeness{font-size:13px;line-height:1.4}
 .err{color:var(--bad);font-size:12px;overflow-wrap:anywhere}
 </style></head><body><div class="page">
 <div><h1>LoRA Sweep</h1><p class="sub">Run one prompt through every LoRA epoch in ComfyUI, then compare the videos side by side. <span id="conn" class="pill">checking ComfyUI</span></p></div>
@@ -506,27 +862,122 @@ button:disabled{opacity:.5;cursor:not-allowed}
  <div class="row" style="margin-top:12px"><button class="primary" id="goBtn" type="button">Generate all</button><button id="cancelBtn" type="button" hidden>Cancel</button><span id="goMsg" class="hint"></span></div>
 </div>
 
+<div class="panel" id="referencePanel">
+ <h2>4. Reference likeness (optional)</h2>
+ <p class="hint">Upload clear photos of your character. The app compares each generated face with the references, then ranks the epochs. <strong>Higher score = closer according to the face model.</strong> Scores are not percentages and small differences may be inconclusive.</p>
+ <div class="row" style="margin-bottom:10px">
+  <div class="field"><label for="referenceUpload">Reference photo(s)</label><input type="file" id="referenceUpload" accept="image/png,image/jpeg,image/webp" multiple></div>
+  <button id="uploadRefBtn" type="button">Upload reference photos</button>
+  <span id="refMsg" class="hint"></span>
+ </div>
+ <div class="loras" id="referenceList" style="max-height:140px"></div>
+ <p class="hint">Scoring requires optional InsightFace, ONNX Runtime, OpenCV, NumPy, and FFmpeg installed in this app's Python environment.</p>
+</div>
+
+<div class="panel" id="voicePanel">
+ <h2>5. Voice similarity (optional)</h2>
+ <p class="hint">Upload clear spoken audio from the character (WAV, MP3, FLAC, M4A or OGG). For each completed speaking video, a local speaker-embedding model compares its audio with the original voice and ranks the epochs. Voice scores are <strong>not percentages</strong> and do not check dialogue accuracy. Use 5–30 seconds of clean reference speech. Videos with no usable speech are marked not scored.</p>
+ <div class="row" style="margin-bottom:10px">
+  <div class="field"><label for="voiceUpload">Original voice sample(s)</label><input type="file" id="voiceUpload" accept=".wav,.mp3,.flac,.m4a,.ogg,audio/*" multiple></div>
+  <button id="uploadVoiceBtn" type="button">Upload voice samples</button>
+  <span id="voiceMsg" class="hint"></span>
+ </div>
+ <div class="loras" id="voiceList" style="max-height:130px"></div>
+ <p class="hint">Optional dependency (install in the Python running this app): <code>python -m pip install resemblyzer</code>. FFmpeg must be on PATH. The first voice comparison loads a small model on CPU. The reference and generated audio stay on your PC.</p>
+</div>
+
+<div class="panel" id="notificationPanel">
+ <h2>Completion notification</h2>
+ <div class="row" style="align-items:center">
+  <label style="display:flex;align-items:center;gap:7px"><input type="checkbox" id="toneEnabled" checked> Enable completion notification</label>
+  <div class="field"><label for="toneMode">Completion sound</label>
+   <select id="toneMode"><option value="chime">Classic chime 🔔</option><option value="nerd">Nerd Alert 🤓 — spoken announcement</option><option value="silent">Silent 🔕</option></select></div>
+  <button id="toneTest" type="button">Test sound</button>
+ </div>
+ <p class="hint">Nerd Alert says “Your LoRA epochs are done, you nerd!” using your browser's speech voice. Keep this tab open and allow audio; browsers may restrict speech from background tabs.</p>
+</div>
+
 <div class="panel" id="results" hidden>
  <div class="row" style="margin-bottom:10px">
   <div class="field"><label for="runSel">Run</label><select id="runSel"></select></div>
   <button id="playBtn" type="button">Play all</button><button id="restartBtn" type="button">Restart</button>
   <div class="field"><label for="speed">Speed</label><select id="speed"><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option></select></div>
   <div class="field"><label for="size">Size</label><input type="range" id="size" min="200" max="700" value="320"></div>
+   <button id="scoreBtn" type="button">Score faces</button>
+   <button id="voiceScoreBtn" type="button">Score voices</button>
   <span id="runMsg" class="hint"></span>
  </div>
  <div class="rank" id="rank" style="margin-bottom:10px"></div>
+ <div id="autoRank" class="scoreboard" style="margin-bottom:12px"></div>
+ <div id="voiceRank" class="scoreboard" style="margin-bottom:12px"></div>
  <div class="grid" id="cards"></div>
 </div>
 </div>
 <script>
 var $=function(i){return document.getElementById(i)};
-var A=null, allLoras=[], chosen=new Set(), runId=null, timer=null, ratings={};
+var A=null, allLoras=[], chosen=new Set(), runId=null, timer=null, ratings={}, selectedReferences=new Set(), selectedVoiceReferences=new Set(), playedRuns=new Set(), armedRun=null, audioCtx=null;
 function api(p,o){return fetch(p,o).then(function(r){return r.json().then(function(j){if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j;});});}
 function post(p,b){return api(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});}
+function chime(){try{var C=window.AudioContext||window.webkitAudioContext;if(!C)return;if(!audioCtx)audioCtx=new C();if(audioCtx.state==='suspended')audioCtx.resume();[523.25,659.25,783.99].forEach(function(hz,i){var o=audioCtx.createOscillator(),g=audioCtx.createGain(),st=audioCtx.currentTime+i*.23;o.type='sine';o.frequency.value=hz;g.gain.setValueAtTime(.0001,st);g.gain.exponentialRampToValueAtTime(.12,st+.025);g.gain.exponentialRampToValueAtTime(.0001,st+.19);o.connect(g);g.connect(audioCtx.destination);o.start(st);o.stop(st+.2);});}catch(e){}}
+function playCompletionSound(){
+ var mode=$('toneMode').value;
+ if(!$('toneEnabled').checked||mode==='silent')return;
+ if(mode==='nerd'){
+  try{
+   if(!('speechSynthesis' in window)||!('SpeechSynthesisUtterance' in window)){chime();return;}
+   window.speechSynthesis.cancel();
+   var msg=new SpeechSynthesisUtterance('Your LoRA epochs are done, you nerd!');
+   msg.lang='en-US';msg.rate=1.04;msg.pitch=1.12;msg.volume=1;
+   msg.onerror=function(){chime();};
+   window.speechSynthesis.speak(msg);
+  }catch(e){chime();}
+ }else chime();
+}
+try{var savedMode=localStorage.getItem('loraSweepSoundMode');if(['chime','nerd','silent'].includes(savedMode))$('toneMode').value=savedMode;
+ var savedEnabled=localStorage.getItem('loraSweepSoundEnabled');if(savedEnabled!==null)$('toneEnabled').checked=savedEnabled==='true';}catch(e){}
+$('toneMode').onchange=function(){try{localStorage.setItem('loraSweepSoundMode',this.value);}catch(e){}};
+$('toneEnabled').onchange=function(){try{localStorage.setItem('loraSweepSoundEnabled',String(this.checked));}catch(e){}};
+$('toneTest').onclick=playCompletionSound;
+function drawReferences(items){var c=$('referenceList');c.innerHTML='';items.forEach(function(n){var l=document.createElement('label'),b=document.createElement('input');b.type='checkbox';b.checked=selectedReferences.has(n);b.onchange=function(){b.checked?selectedReferences.add(n):selectedReferences.delete(n);};l.appendChild(b);l.appendChild(document.createTextNode(n));c.appendChild(l);});}
+function loadReferences(){api('/api/references').then(function(d){drawReferences(d.references);}).catch(function(e){$('refMsg').textContent='Could not load references: '+e.message;});}
+$('uploadRefBtn').onclick=function(){var files=Array.from($('referenceUpload').files||[]);if(!files.length){$('refMsg').textContent='Choose one or more images first';return;}
+$('refMsg').textContent='Uploading...';Promise.all(files.map(function(file){return new Promise(function(resolve,reject){var reader=new FileReader();reader.onload=function(){var data=String(reader.result).split(',')[1];post('/api/reference',{name:file.name,base64:data}).then(function(r){selectedReferences.add(r.name);resolve();}).catch(reject);};reader.onerror=reject;reader.readAsDataURL(file);});})).then(function(){loadReferences();$('refMsg').textContent='References uploaded';}).catch(function(e){$('refMsg').textContent=e.message;});};
+function drawVoiceReferences(items){var c=$('voiceList');c.innerHTML='';items.forEach(function(n){var l=document.createElement('label'),b=document.createElement('input');b.type='checkbox';b.checked=selectedVoiceReferences.has(n);b.onchange=function(){b.checked?selectedVoiceReferences.add(n):selectedVoiceReferences.delete(n);};l.appendChild(b);l.appendChild(document.createTextNode(n));c.appendChild(l);});}
+function loadVoiceReferences(){api('/api/voice_references').then(function(d){drawVoiceReferences(d.references);}).catch(function(e){$('voiceMsg').textContent='Could not list voices: '+e.message;});}
+$('uploadVoiceBtn').onclick=function(){var files=Array.from($('voiceUpload').files||[]);if(!files.length){$('voiceMsg').textContent='Choose an audio file first';return;}
+$('voiceMsg').textContent='Uploading...';Promise.all(files.map(function(file){return new Promise(function(resolve,reject){if(file.size>20000000){reject(new Error('Each voice file must be under 20 MB'));return;}var reader=new FileReader();reader.onload=function(){var data=String(reader.result).split(',')[1];post('/api/voice_reference',{name:file.name,base64:data}).then(function(r){selectedVoiceReferences.add(r.name);resolve();}).catch(reject);};reader.onerror=reject;reader.readAsDataURL(file);});})).then(function(){loadVoiceReferences();$('voiceMsg').textContent='Voice reference uploaded';}).catch(function(e){$('voiceMsg').textContent=e.message;});};
+function renderVoiceRanking(scored){
+ var ar=$('voiceRank');ar.innerHTML='';if(!scored.length)return;
+ var h=document.createElement('h3');h.textContent='Voice similarity ranking';ar.appendChild(h);
+ var intro=document.createElement('p');intro.textContent='Higher = closer according to the speaker model. NOT a voice identity percentage. Background sounds and very short speech can distort scores.';ar.appendChild(intro);
+ scored.forEach(function(j,i){var r=document.createElement('div');r.className='score-row';var left=document.createElement('div');var n=document.createElement('strong');n.textContent=label(j.label);left.appendChild(n);
+ var bar=document.createElement('div');bar.className='scorebar';var fill=document.createElement('div');fill.className='scorefill';fill.style.width=Math.max(0,Math.min(100,j.voice_similarity.cosine_similarity*100))+'%';bar.appendChild(fill);left.appendChild(bar);
+ var val=document.createElement('span');val.className='val';val.textContent=fmtScore(j.voice_similarity.cosine_similarity);var place=document.createElement('span');place.className='place';place.textContent='#'+(i+1);r.appendChild(left);r.appendChild(val);r.appendChild(place);ar.appendChild(r);});
+ if(scored.length>1){var gap=scored[0].voice_similarity.cosine_similarity-scored[1].voice_similarity.cosine_similarity;var note=document.createElement('div');note.className='score-note';note.textContent='Top voice match: '+label(scored[0].label)+' — lead of '+fmtScore(gap)+'. '+(gap<0.04?'Close result; listen to both clips.':'Listen to the finalists to confirm.');ar.appendChild(note);}
+ var f=document.createElement('p');f.textContent='Speaker similarity does not measure whether the correct words were spoken. Keep face and voice scores separate; confirm by listening.';ar.appendChild(f);
+}
 function label(n){var m=n.match(/(\d+)(?!.*\d)/);return m?('Epoch '+parseInt(m[1],10)):n;}
 function nat(a,b){return a.localeCompare(b,undefined,{numeric:true});}
+function fmtScore(v){return Number(v).toFixed(3);}
+function closenessNote(gap){if(gap<0.02)return 'Very close — the scores alone do not establish a clear winner.';if(gap<0.05)return 'Small difference — review both videos before choosing.';return 'A more noticeable score difference — still confirm likeness visually.';}
+function renderAutoRanking(scored){
+ var ar=$('autoRank');ar.innerHTML='';if(!scored.length)return;
+ var h=document.createElement('h3');h.textContent='Reference likeness ranking';ar.appendChild(h);
+ var top=scored[0].likeness.cosine_similarity;
+ var intro=document.createElement('p');intro.textContent='Higher = closer match according to the face model. Scores are cosine similarities, NOT likeness percentages.';ar.appendChild(intro);
+ scored.forEach(function(j,i){
+  var r=document.createElement('div');r.className='score-row';
+  var left=document.createElement('div');var n=document.createElement('strong');n.textContent=label(j.label);left.appendChild(n);
+  var bar=document.createElement('div');bar.className='scorebar';var fill=document.createElement('div');fill.className='scorefill';fill.style.width=Math.max(0,Math.min(100,j.likeness.cosine_similarity*100))+'%';bar.appendChild(fill);left.appendChild(bar);
+  var val=document.createElement('span');val.className='val';val.textContent=fmtScore(j.likeness.cosine_similarity);
+  var place=document.createElement('span');place.className='place';place.textContent='#'+(i+1);
+  r.appendChild(left);r.appendChild(val);r.appendChild(place);ar.appendChild(r);
+ });
+ if(scored.length>1){var gap=top-scored[1].likeness.cosine_similarity;var note=document.createElement('div');note.className='score-note';note.textContent='Top result: '+label(scored[0].label)+'. Difference from 2nd place: '+fmtScore(gap)+'. '+closenessNote(gap);ar.appendChild(note);}
+ var footer=document.createElement('p');footer.textContent='These values are model-specific similarity measurements. Different lighting, expression and camera angle can affect them. Use the videos and your own ratings to choose the best checkpoint.';ar.appendChild(footer);
+}
 
-function status(){api('/api/status').then(function(s){var c=$('conn');c.textContent=s.comfy?('ComfyUI connected at '+s.url):('Cannot reach ComfyUI at '+s.url+'. Start it, then reload.');c.className='pill '+(s.comfy?'ok':'bad');});}
+function status(){api('/api/status').then(function(s){var c=$('conn');c.textContent=s.comfy?('ComfyUI connected at '+s.url):('Cannot reach ComfyUI at '+s.url+'. Start it, then reload.');c.className='pill '+(s.comfy?'ok':'bad');}).catch(function(e){var c=$('conn');c.textContent='App API error: '+e.message;c.className='pill bad';});}
 function showAnalysis(a){
  A=a; $('pickers').hidden=false; $('gen').hidden=false;
  var ln=$('loraNode'); ln.innerHTML='';
@@ -556,33 +1007,40 @@ $('goBtn').onclick=function(){
  if(!t){$('goMsg').textContent='Pick a prompt field.';return;}
  if(!$('prompt').value.trim()){$('goMsg').textContent='Write a prompt first.';return;}
  var loras=Array.from(chosen).sort(nat);
+ var loaded=A.loras.find(function(l){return l.id===$('loraNode').value;});
+ if(loaded&&!confirm('Confirm epoch-swapping loader:\nNode '+loaded.id+' — '+loaded.current+'\nSelected checkpoints: '+loras.length+'\n\nContinue?'))return;
  $('goMsg').textContent='Starting...';
- post('/api/run',{lora_node:$('loraNode').value,prompt_node:{id:t.id,key:t.key},prompt:$('prompt').value,seed:$('seed').value,strength:$('strength').value,loras:loras,baseline:$('baseline').checked})
-  .then(function(run){$('goMsg').textContent='';openRun(run.id);}).catch(function(x){$('goMsg').textContent=x.message;});
+ post('/api/run',{lora_node:$('loraNode').value,prompt_node:{id:t.id,key:t.key},prompt:$('prompt').value,seed:$('seed').value,strength:$('strength').value,loras:loras,baseline:$('baseline').checked,reference_names:Array.from(selectedReferences),voice_reference_names:Array.from(selectedVoiceReferences)})
+  .then(function(run){$('goMsg').textContent='';armedRun=run.id;playedRuns.delete(run.id);openRun(run.id);}).catch(function(x){$('goMsg').textContent=x.message;});
 };
 $('cancelBtn').onclick=function(){if(runId)post('/api/run/'+runId+'/cancel');};
 
 function refreshRuns(sel){api('/api/runs').then(function(rs){var s=$('runSel');s.innerHTML='';rs.forEach(function(r){var o=document.createElement('option');o.value=r.id;o.textContent=r.id+' · '+r.count+' videos · '+r.prompt;s.appendChild(o);});if(sel)s.value=sel;$('results').hidden=!rs.length;});}
 $('runSel').onchange=function(){openRun(this.value);};
-function openRun(id){runId=id;try{ratings=JSON.parse(localStorage.getItem('sweep:'+id)||'{}');}catch(e){ratings={};}refreshRuns(id);poll();}
-function poll(){clearTimeout(timer);api('/api/run/'+runId).then(function(run){drawRun(run);if(!run.finished)timer=setTimeout(poll,2000);}).catch(function(x){$('runMsg').textContent=x.message;});}
+function openRun(id){if(runId!==id){$('cards').innerHTML='';firstAR=false;}runId=id;try{ratings=JSON.parse(localStorage.getItem('sweep:'+id)||'{}');}catch(e){ratings={};}refreshRuns(id);poll();}
+function poll(){clearTimeout(timer);var requested=runId;api('/api/run/'+requested).then(function(run){if(requested!==runId)return;drawRun(run);if(!run.finished||run.analyzing||run.voice_analyzing)timer=setTimeout(poll,2000);}).catch(function(x){$('runMsg').textContent=x.message;});}
+$('voiceScoreBtn').onclick=function(){if(!runId)return;var refs=Array.from(selectedVoiceReferences);if(!refs.length){$('runMsg').textContent='Upload and select a voice sample first';return;}post('/api/run/'+runId+'/voice_score',{voice_reference_names:refs}).then(poll).catch(function(e){$('runMsg').textContent=e.message;});};
+$('scoreBtn').onclick=function(){if(!runId)return;var refs=Array.from(selectedReferences);if(!refs.length){$('runMsg').textContent='Upload and select a reference first';return;}post('/api/run/'+runId+'/score',{reference_names:refs}).then(poll).catch(function(e){$('runMsg').textContent=e.message;});};
 
 var firstAR=false;
 function drawRun(run){
  var done=run.jobs.filter(function(j){return j.status==='done';}).length;
- $('runMsg').textContent=done+' of '+run.jobs.length+' finished'+(run.finished?'':'. Generating...');
+ $('runMsg').textContent=done+' of '+run.jobs.length+' finished'+(run.finished?'':'. Generating...')+(run.analyzing?' · Computing face similarity...':'')+(run.analysis_error?' · Face scoring: '+run.analysis_error:'')+(run.voice_analyzing?' · Comparing voices...':'')+(run.voice_analysis_error?' · Voice scoring: '+run.voice_analysis_error:'');
+ if(run.finished&&armedRun===run.id&&!playedRuns.has(run.id)){playedRuns.add(run.id);playCompletionSound();}
  $('cancelBtn').hidden=run.finished;
  var cards=$('cards'), have={};
  Array.prototype.forEach.call(cards.children,function(c){have[c.dataset.label]=c;});
  run.jobs.forEach(function(j){
   var c=have[j.label];
   if(!c){c=document.createElement('div');c.className='card';c.dataset.label=j.label;
-   c.innerHTML='<h3></h3><small></small><div class="frame"></div><div class="rate"></div><div class="err"></div>';
+   c.innerHTML='<h3></h3><small></small><div class="frame"></div><div class="hint likeness"></div><div class="hint voice-match"></div><div class="rate"></div><div class="err"></div>';
    var rt=c.querySelector('.rate');for(var v=1;v<=5;v++){(function(v){var b=document.createElement('button');b.textContent=v;b.onclick=function(){if(ratings[j.label]===v)delete ratings[j.label];else ratings[j.label]=v;try{localStorage.setItem('sweep:'+runId,JSON.stringify(ratings));}catch(e){}paint();};rt.appendChild(b);})(v);}
    cards.appendChild(c);}
   c.querySelector('h3').textContent=j.baseline?'Baseline':label(j.label);
   c.querySelector('small').textContent=j.baseline?'No LoRA effect (strength 0)':j.lora;
-  c.querySelector('.err').textContent=j.error||'';
+  c.querySelector('.err').textContent=j.error||j.likeness_error||j.voice_error||'';
+   c.querySelector('.likeness').textContent=j.likeness?('Reference match: '+fmtScore(j.likeness.cosine_similarity)+' (higher is better) · '+j.likeness.frames_scored+' frames checked'):(j.status==='done'?'Not scored yet':'');
+  c.querySelector('.voice-match').textContent=j.voice_similarity?('Voice match: '+fmtScore(j.voice_similarity.cosine_similarity)+' (higher is better)'):(j.voice_error?'Voice not scored: '+j.voice_error:'');
   var fr=c.querySelector('.frame');
   if(j.status==='done'&&j.file){
    if(fr.dataset.src!==j.file){fr.dataset.src=j.file;fr.innerHTML='';var isImg=/\.(gif|webp|png|jpe?g)$/i.test(j.file);var m=document.createElement(isImg?'img':'video');m.src=j.file;
@@ -590,6 +1048,10 @@ function drawRun(run){
     fr.appendChild(m);}
   }else{fr.dataset.src='';fr.textContent=j.status==='error'?'Failed':(j.status==='running'?'Generating...':(j.status==='cancelled'?'Cancelled':'Waiting in queue'));}
  });
+ var scored=run.jobs.filter(function(j){return j.likeness&&typeof j.likeness.cosine_similarity==='number'&&!j.baseline;}).sort(function(a,b){return b.likeness.cosine_similarity-a.likeness.cosine_similarity;});
+ renderAutoRanking(scored);
+ var voices=run.jobs.filter(function(j){return j.voice_similarity&&typeof j.voice_similarity.cosine_similarity==='number'&&!j.baseline;}).sort(function(a,b){return b.voice_similarity.cosine_similarity-a.voice_similarity.cosine_similarity;});
+ renderVoiceRanking(voices);
  paint();
 }
 function paint(){
@@ -611,8 +1073,10 @@ $('speed').onchange=function(){vids().forEach(function(v){v.playbackRate=+$('spe
 $('size').oninput=function(){document.documentElement.style.setProperty('--cw',this.value+'px');};
 
 status();
+loadReferences();
 api('/api/workflow').then(showAnalysis).catch(function(){});
 refreshRuns();
+loadVoiceReferences();
 api('/api/runs').then(function(rs){if(rs.length)openRun(rs[0].id);});
 </script></body></html>
 """
